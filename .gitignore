@@ -1,5 +1,8 @@
 target/
 debug/
+.env
+tools/tiles/
 **/*.rs.bk
 .DS_Store
 cacert.pem
+.env

@@ -6,8 +6,10 @@ use esp_hal::{
     },
     spi::master::{Instance, Spi},
 };
+use screen::Screen;
 
 pub struct Display {
+    screen: Screen,
     cs:   Output<'static>,
     dc:   Output<'static>,
     rst:  Output<'static>,

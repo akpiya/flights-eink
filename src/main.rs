@@ -4,6 +4,7 @@
 mod display;
 mod encoder;
 mod flight;
+mod screen;
 
 use display::Display;
 use encoder::RotaryEncoder;
