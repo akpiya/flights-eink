@@ -4,7 +4,7 @@ pub const HEIGHT: usize = 680;
 pub const PIXELS: usize = WIDTH * HEIGHT;
 
 const BITS_PER_BYTE: usize = 8;
-const BUF_BYTES: usize = PIXELS / BITS_PER_BYTE;
+pub const PANEL_BYTES: usize = PIXELS / BITS_PER_BYTE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color {
@@ -13,20 +13,16 @@ pub enum Color {
 }
 
 pub struct Screen {
-    buf: [u8; BUF_BYTES],
+    buf: [u8; PANEL_BYTES],
 }
 
 impl Screen {
     pub const fn new() -> Self {
-        Self { buf: [0xFF; BUF_BYTES] }
+        Self { buf: [0xFF; PANEL_BYTES] }
     }
 
-    pub const fn width(&self) -> usize {
-        WIDTH
-    }
-
-    pub const fn height(&self) -> usize {
-        HEIGHT
+    pub(crate) fn load_panel_bytes(&mut self, bytes: &[u8; PANEL_BYTES]) {
+        self.buf.copy_from_slice(bytes);
     }
 
     pub fn in_bounds(&self, i: usize, j: usize) -> bool {
@@ -60,5 +56,9 @@ impl Screen {
             Color::White => self.buf[buf_byte_pos] |= mask,
             Color::Black => self.buf[buf_byte_pos] &= !mask,
         }
+    }
+
+   pub(crate) fn panel_bytes(&self) -> &[u8] {
+        &self.buf
     }
 }

@@ -9,14 +9,29 @@ use reqwless::{
     Certificate, TlsReference, TlsVersion, X509,
 };
 
-static TCP_STATE: TcpClientState<1, 4096, 4096> = TcpClientState::new();
+use static_cell::StaticCell;
 
-pub async fn get_airplanes<'a>(
+static TCP_STATE: StaticCell<TcpClientState<1, 4096, 4096>> = StaticCell::new();
+
+pub struct Flight {
+    latitude: f32,
+    longitude: f32,
+    call_sign: [u8; 8],
+    call_sign_len: u8,
+    ground_speed: u32, // knots
+    heading: u32,      // degrees
+    altitude: u32,     // feet
+}
+
+pub async fn get_flights<'a>(
     stack: Stack<'a>,
     ca: Certificate<'a>,
-    tls:TlsReference<'a>
+    tls:TlsReference<'a>,
+    latitude: f32,
+    longitude: f32,
+    radius: u32,
 ) -> Result<(), reqwless::Error> {
-    let tcp = TcpClient::new(stack, &TCP_STATE);
+    let tcp = TcpClient::new(stack, TCP_STATE.init(TcpClientState::new()));
     let dns = DnsSocket::new(stack);
     let tls_config = TlsConfig::new(TlsVersion::Tls1_3, ca, None, tls);
     let mut client = HttpClient::new_with_tls(&tcp, &dns, tls_config);
@@ -28,6 +43,7 @@ pub async fn get_airplanes<'a>(
         .send(&mut response_buffer)
         .await?;
 
+    for
+
     Ok(())
 }
-
