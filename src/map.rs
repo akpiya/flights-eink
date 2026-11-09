@@ -1,10 +1,18 @@
-use crate::screen::{Screen, PANEL_BYTES};
+use crate::screen::PANEL_BYTES;
 
-const MAP_RECORD_BYTES: usize = PANEL_BYTES + 1;
+/// Each record is a zoom byte followed by the map's two 4-gray RAM planes.
+const MAP_RECORD_BYTES: usize = 1 + 2 * PANEL_BYTES;
 static MAP_BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/maps.bin"));
 
 pub const MAP_LATITUDE: &str = env!("MAP_LATITUDE");
 pub const MAP_LONGITUDE: &str = env!("MAP_LONGITUDE");
+
+/// A 4-gray map image as the two bit planes the panel's RAMs take
+/// (see `build.rs` for how each tone is encoded). Lives in flash.
+pub struct GrayImage {
+    pub bw_ram: &'static [u8],
+    pub red_ram: &'static [u8],
+}
 
 pub struct Map {
     map_selection: usize,
@@ -24,14 +32,12 @@ impl Map {
         }
     }
 
-    pub fn draw_background(&self, screen: &mut Screen) {
+    pub fn background(&self) -> GrayImage {
         let record = map_records()
             .nth(self.map_selection)
             .expect("map selection is valid");
-        let image: &[u8; PANEL_BYTES] = record[1..]
-            .try_into()
-            .expect("map record contains one panel image");
-        screen.load_panel_bytes(image);
+        let (bw_ram, red_ram) = record[1..].split_at(PANEL_BYTES);
+        GrayImage { bw_ram, red_ram }
     }
 }
 

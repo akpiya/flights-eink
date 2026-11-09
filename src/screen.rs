@@ -21,10 +21,6 @@ impl Screen {
         Self { buf: [0xFF; PANEL_BYTES] }
     }
 
-    pub(crate) fn load_panel_bytes(&mut self, bytes: &[u8; PANEL_BYTES]) {
-        self.buf.copy_from_slice(bytes);
-    }
-
     pub fn in_bounds(&self, i: usize, j: usize) -> bool {
         i < HEIGHT && j < WIDTH
     }

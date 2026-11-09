@@ -26,7 +26,9 @@ mbedtls-rs = { version = "0.1.0" }
 
 [build-dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+mvt-reader = "2.5.0"
+tiny-skia = "0.12.0"
+geo-types = { version = "0.7", default-features = false }
 
 [profile.dev]
 opt-level = "s"
