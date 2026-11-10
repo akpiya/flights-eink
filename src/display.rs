@@ -127,6 +127,13 @@ impl Display {
     }
 
     fn wait_until_idle(&mut self) -> Result<(), DisplayError> {
+        // BUSY can take a moment to rise after a command (notably right after the
+        // panel powers up), so give it a chance before treating low as "idle".
+        let rise_start = Instant::now();
+        while self.busy.is_low() && rise_start.elapsed() < Duration::from_millis(200) {
+            self.delay.delay_millis(1);
+        }
+
         let start = Instant::now();
         defmt::info!("BUSY at wait start: high={}", self.busy.is_high());
         while self.busy.is_high() {
@@ -154,7 +161,23 @@ impl Display {
         self.send_data(data)
     }
 
+    /// Initializes the panel in 4-gray mode.
     pub fn init(&mut self) -> Result<(), DisplayError> {
+        self.init_controller(0x00)?;
+
+        // Load the 4-gray waveform in place of the built-in black/white one.
+        self.command(Command::WriteLut, &LUT_4GRAY[..105])?;
+        self.command(Command::GateVoltage, &LUT_4GRAY[105..106])?;
+        self.command(Command::SourceVoltage, &LUT_4GRAY[106..109])?;
+        self.command(Command::WriteVcom, &LUT_4GRAY[109..110])?;
+        self.wait_until_idle()
+    }
+
+    /// Resets the controller and sets up the panel geometry. The software reset also
+    /// restores the controller's built-in black/white waveform.
+    fn init_controller(&mut self, border: u8) -> Result<(), DisplayError> {
+       self.pwr.set_level(Level::High);
+        self.delay.delay_millis(500);
         self.hardware_reset();
         self.delay.delay_millis(100);
         self.wait_until_idle()?;
@@ -168,17 +191,33 @@ impl Display {
         self.command(Command::DataEntryMode, &[0x03])?;
         self.command(Command::RamXWindow, &[0x00, 0x00, X_END[0], X_END[1]])?;
         self.command(Command::RamYWindow, &[0x00, 0x00, Y_END[0], Y_END[1]])?;
-        self.command(Command::BorderWaveform, &[0x00])?;
+        self.command(Command::BorderWaveform, &[border])?;
         self.command(Command::TemperatureSensor, &[0x80])?;
         self.command(Command::RamXCounter, &[0x00, 0x00])?;
         self.command(Command::RamYCounter, &[0x00, 0x00])?;
-
-        // Load the 4-gray waveform in place of the built-in black/white one.
-        self.command(Command::WriteLut, &LUT_4GRAY[..105])?;
-        self.command(Command::GateVoltage, &LUT_4GRAY[105..106])?;
-        self.command(Command::SourceVoltage, &LUT_4GRAY[106..109])?;
-        self.command(Command::WriteVcom, &LUT_4GRAY[109..110])?;
         self.wait_until_idle()
+    }
+
+    /// Prepares the panel for storage: clears it to white with a normal black/white
+    /// full refresh (an image left on the panel for a long time can burn in), puts
+    /// the controller into deep sleep, and switches off the panel's power.
+    pub fn clear_and_sleep(&mut self) -> Result<(), DisplayError> {
+        self.init_controller(0x01)?;
+        let white = [0xFF; WIDTH / 8];
+        for command in [Command::WriteImage, Command::WriteRedImage] {
+            self.send_command(command)?;
+            for _ in 0..HEIGHT {
+                self.send_data(&white)?;
+            }
+        }
+        self.send_command(Command::ImageUpdate)?;
+        self.send_data(&[0xF7])?;
+        self.send_command(Command::MasterActivation)?;
+        self.wait_until_idle()?;
+
+        self.sleep()?;
+        self.pwr.set_level(Level::Low);
+        Ok(())
     }
 
     /// Shows a 4-gray background with the screen's black pixels drawn on top.
