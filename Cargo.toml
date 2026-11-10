@@ -20,9 +20,13 @@ esp-alloc = { version = "0.11.0", features = ["esp32"] }
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp32", "unstable", "wifi", "defmt"] }
 embassy-net = { version = "0.9.1", default-features = false, features = ["defmt", "dhcpv4", "dns", "medium-ethernet", "proto-ipv4", "tcp", "udp"] }
 embassy-executor = "0.10"
-static_cell = "1"
+static_cell = "2"
 reqwless = { git = "https://github.com/drogue-iot/reqwless", default-features = false, features = ["defmt", "mbedtls-rs"] }
-mbedtls-rs = { version = "0.1.0" }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde-json-core = "0.7"
+heapless = { version = "0.9", features = ["serde"] }
+embassy-time = "0.5"
+mbedtls-rs = "0.1.0"
 
 [build-dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls"] }
