@@ -4,5 +4,4 @@ debug/
 tools/tiles/
 **/*.rs.bk
 .DS_Store
-cacert.pem
 .env
