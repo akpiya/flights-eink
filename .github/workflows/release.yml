@@ -1,0 +1,59 @@
+# Builds the firmware on every push to main and publishes it to GitHub Pages, where
+# devices download it (see src/ota.rs).
+name: Release firmware
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A newer push makes an in-progress release pointless.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32
+          version: 1.97.0.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install espflash
+        run: |
+          curl -sSfL https://github.com/esp-rs/espflash/releases/download/v4.6.0/espflash-x86_64-unknown-linux-gnu.zip -o espflash.zip
+          unzip -q espflash.zip -d "$HOME/.local/bin"
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir site
+          espflash save-image --chip esp32 --flash-size 4mb \
+            target/xtensa-esp32-none-elf/release/epaper site/firmware.bin
+          echo "$GITHUB_SHA $(stat -c %s site/firmware.bin) $(sha256sum site/firmware.bin | cut -d ' ' -f 1)" > site/version.txt
+          cat site/version.txt
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/deploy-pages@v5

@@ -4,6 +4,9 @@
 mod display;
 mod encoder;
 mod flight;
+mod https;
+mod ota;
+mod wifi_config;
 mod screen;
 mod map;
 
@@ -12,7 +15,8 @@ use core::ffi::CStr;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
+use esp_bootloader_esp_idf::partitions::FlashStorage;
 use esp_backtrace as _;
 use esp_hal::{
     ram,
@@ -29,18 +33,17 @@ use static_cell::StaticCell;
 
 use display::Display;
 use encoder::RotaryEncoder;
-use flight::FlightClient;
+use https::Https;
 use map::Map;
 use screen::Screen;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// Set in the gitignored .env, which must be sourced before building.
-const WIFI_SSID: &str = env!("WIFI_SSID");
-const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+// ISRG Root X1 and X2: the Let's Encrypt chains of adsb.lol and GitHub Pages lead
+// to them.
+const ROOT_CERTS: &str = concat!(include_str!("../certs/isrg-roots.pem"), "\0");
 
-// ISRG Root X1 and X2: adsb.lol's Let's Encrypt chain leads to both.
-const ROOT_CERTS: &str = concat!(include_str!("../certs/adsb-lol-roots.pem"), "\0");
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 static TLS_RNG: StaticCell<Trng> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
@@ -49,6 +52,8 @@ static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 async fn main(spawner: Spawner) -> ! {
     info!("Initializing");
     let peripherals = esp_hal::init(esp_hal::Config::default());
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    ota::check_previous_boot(&mut flash);
 
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 96 * 1024);
     esp_alloc::heap_allocator!(size: 16 * 1024);
@@ -76,6 +81,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     info!("Boot marker (absorbs the first undecodable defmt frame)");
+    info!("Firmware version {}", ota::VERSION);
     let mut screen = Screen::new();
     let map = Map::new();
     display.init().unwrap();
@@ -89,11 +95,17 @@ async fn main(spawner: Spawner) -> ! {
     let trng = TLS_RNG.init(Trng::try_new().expect("TRNG source is enabled"));
     let seed = u64::from(trng.random()) << 32 | u64::from(trng.random());
 
+    let Some(wifi) = wifi_config::read(&mut flash) else {
+        info!("No WiFi config on this device; run tools/flash-wifi.sh");
+        loop {
+            core::future::pending::<()>().await;
+        }
+    };
     let station = Config::Station(
         StationConfig::default()
-            .with_ssid(WIFI_SSID.try_into().expect("SSID is at most 32 bytes"))
+            .with_ssid(wifi.ssid.as_str().try_into().expect("SSID is at most 32 bytes"))
             .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
-                WIFI_PASSWORD.try_into().expect("password is at most 64 bytes"),
+                wifi.password.as_str().try_into().expect("password is at most 64 bytes"),
             )),
     );
     let controller = WifiController::new(
@@ -111,14 +123,22 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(run_network(runner).expect("task is free"));
     stack.wait_config_up().await;
     info!("Got IP: {}", stack.config_v4().map(|config| config.address));
+    ota::mark_healthy(&mut flash);
 
     let tls = Tls::new(trng).expect("only TLS instance");
     let root_certs = CStr::from_bytes_with_nul(ROOT_CERTS.as_bytes()).expect("one trailing NUL");
     let ca = Certificate::new(X509::PEM(root_certs)).expect("root certificates parse");
-    let mut flights = FlightClient::new(stack, ca, tls.reference());
+    let mut https = Https::new(stack, ca, tls.reference());
 
+    let mut next_update_check = Instant::now();
     loop {
-        match flights.get_flights(30.2672, -97.7431, 25).await {
+        if Instant::now() >= next_update_check {
+            if let Err(error) = ota::update(&mut https, &mut flash).await {
+                info!("Update failed: {}", error);
+            }
+            next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+        }
+        match flight::get_flights(&mut https, 30.2672, -97.7431, 25).await {
             Ok(flights) => {
                 info!("{} flights", flights.len());
                 for flight in &flights {
