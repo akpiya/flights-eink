@@ -6,14 +6,10 @@ use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke,
 const WIDTH: usize = 960;
 const HEIGHT: usize = 680;
 const PANEL_BYTES: usize = (WIDTH * HEIGHT) / 8;
-// Each packed byte holds 8 horizontal pixels, so rows must not straddle bytes.
-const _: () = assert!(WIDTH % 8 == 0);
 
-/// OpenFreeMap: free OpenStreetMap vector tiles (OpenMapTiles schema), no API key.
-/// Its terms ask offline downloads to identify themselves with a unique User-Agent.
 const TILEJSON_URL: &str = "https://tiles.openfreemap.org/planet";
 const USER_AGENT: &str = "epaper-map-builder/0.1";
-const TILE_SIZE: u32 = 256;
+const TILE_SIZE: i64 = 256;
 
 const DEFAULT_ZOOMS: &str = "13";
 const DEFAULT_LATITUDE: &str = "30.2672";
@@ -86,16 +82,22 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MAP_LONGITUDE");
 
     let zooms = parse_zooms(&env::var("MAP_ZOOMS").unwrap_or_else(|_| DEFAULT_ZOOMS.into()));
-    let latitude = parse_coordinate("MAP_LATITUDE", DEFAULT_LATITUDE, -85.0, 85.0);
-    let longitude = parse_coordinate("MAP_LONGITUDE", DEFAULT_LONGITUDE, -180.0, 180.0);
-    println!("cargo:rustc-env=MAP_LATITUDE={latitude}");
-    println!("cargo:rustc-env=MAP_LONGITUDE={longitude}");
+    let latitude = parse_coordinate(
+        &env::var("MAP_LATITUDE").unwrap_or_else(|_| DEFAULT_LATITUDE.into()),
+        -85.0,
+        85.0,
+    );
+    let longitude = parse_coordinate(
+        &env::var("MAP_LONGITUDE").unwrap_or_else(|_| DEFAULT_LONGITUDE.into()),
+        -180.0,
+        180.0,
+    );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
 
-    let tile_url = tile_url_template();
+    let tile_url_pattern = fetch_tile_url_pattern();
     let mut maps = Vec::with_capacity(zooms.len() * (1 + 2 * PANEL_BYTES));
     for zoom in zooms {
-        let map = render_map(&tile_url, zoom, latitude.into(), longitude.into());
+        let map = render_map(&tile_url_pattern, zoom, latitude.into(), longitude.into());
         let (bw_ram, red_ram) = pack_ram_planes(&map);
         maps.push(zoom);
         maps.extend(bw_ram);
@@ -105,16 +107,15 @@ fn main() {
     fs::write(out_dir.join("maps.bin"), maps).expect("write map data bundle");
 }
 
-fn parse_coordinate(name: &str, default: &str, min: f32, max: f32) -> f32 {
-    let value: f32 = env::var(name)
-        .unwrap_or_else(|_| default.into())
+fn parse_coordinate(value: &str, min: f32, max: f32) -> f32 {
+    let coordinate: f32 = value
         .parse()
-        .unwrap_or_else(|_| panic!("{name} must be a number"));
+        .unwrap_or_else(|_| panic!("coordinate {value:?} must be a number"));
     assert!(
-        value.is_finite() && (min..=max).contains(&value),
-        "{name} must be between {min} and {max}"
+        coordinate.is_finite() && (min..=max).contains(&coordinate),
+        "coordinate {value} must be between {min} and {max}"
     );
-    value
+    coordinate
 }
 
 fn parse_zooms(value: &str) -> Vec<u8> {
@@ -150,26 +151,31 @@ fn get(url: &str) -> Vec<u8> {
         .unwrap_or_else(|error| panic!("failed to download {url}: {error}"))
 }
 
-/// OpenFreeMap's tile URLs contain a dataset version that changes weekly, so read
-/// the current template (`.../{z}/{x}/{y}.pbf`) from its TileJSON.
-fn tile_url_template() -> String {
+/// Fetches OpenFreeMap's current tile URL pattern (`.../{z}/{x}/{y}.pbf`) from its
+/// TileJSON. The URL contains a data version that changes with each OpenFreeMap update.
+fn fetch_tile_url_pattern() -> String {
     let tilejson = String::from_utf8(get(TILEJSON_URL)).expect("TileJSON is UTF-8");
     let start = tilejson
         .find("https://")
         .expect("TileJSON contains a tile URL");
     let end = start + tilejson[start..].find('"').expect("tile URL is a JSON string");
-    let template = &tilejson[start..end];
+    let pattern = &tilejson[start..end];
     assert!(
-        template.contains("{z}/{x}/{y}"),
-        "unexpected tile URL in TileJSON: {template}"
+        pattern.contains("{z}/{x}/{y}"),
+        "unexpected tile URL in TileJSON: {pattern}"
     );
-    template.to_owned()
+    pattern.to_owned()
 }
 
-/// Web Mercator: converts a coordinate to its pixel position in the whole-world
-/// image at `zoom`, which is `TILE_SIZE * 2^zoom` pixels on each side.
+/// Converts a coordinate to its "world pixel": its position in an imaginary image of
+/// the whole Earth at `zoom`, which is `TILE_SIZE * 2^zoom` pixels on each side
+/// (2,097,152 at zoom 13) and is cut into `TILE_SIZE` tiles. x runs east from
+/// longitude -180; y runs south from the top, using Web Mercator, which stretches
+/// latitudes away from the equator. World pixels relate everything: dividing by
+/// `TILE_SIZE` gives a tile's column and row, and subtracting the map's top-left
+/// world pixel gives a position on the map.
 fn world_pixel(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
-    let world_size = f64::from(TILE_SIZE) * f64::from(1u32 << zoom);
+    let world_size = TILE_SIZE as f64 * f64::from(1u32 << zoom);
     let x = (longitude + 180.0) / 360.0 * world_size;
     let y = (1.0 - latitude.to_radians().tan().asinh() / PI) / 2.0 * world_size;
     (x, y)
@@ -177,30 +183,30 @@ fn world_pixel(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
 
 /// Downloads every vector tile overlapping a WIDTH x HEIGHT window centered on the
 /// coordinate and draws them into one image of `Tone`s.
-fn render_map(tile_url: &str, zoom: u8, latitude: f64, longitude: f64) -> Vec<Tone> {
+fn render_map(tile_url_pattern: &str, zoom: u8, latitude: f64, longitude: f64) -> Vec<Tone> {
     let (center_x, center_y) = world_pixel(latitude, longitude, zoom);
     let left = (center_x - WIDTH as f64 / 2.0).round() as i64;
     let top = (center_y - HEIGHT as f64 / 2.0).round() as i64;
-    let tile = i64::from(TILE_SIZE);
     let tiles_per_side = 1i64 << zoom;
 
     let mut tiles = Vec::new();
-    for tile_y in top.div_euclid(tile)..=(top + HEIGHT as i64 - 1).div_euclid(tile) {
+    for tile_y in top.div_euclid(TILE_SIZE)..=(top + HEIGHT as i64 - 1).div_euclid(TILE_SIZE) {
         assert!(
             (0..tiles_per_side).contains(&tile_y),
             "map at zoom {zoom} extends past the top or bottom of the world"
         );
-        for tile_x in left.div_euclid(tile)..=(left + WIDTH as i64 - 1).div_euclid(tile) {
-            // Longitude wraps around, so tile columns do too.
+        for tile_x in left.div_euclid(TILE_SIZE)..=(left + WIDTH as i64 - 1).div_euclid(TILE_SIZE) {
             let wrapped_x = tile_x.rem_euclid(tiles_per_side);
-            let url = tile_url
+            let url = tile_url_pattern
                 .replace("{z}", &zoom.to_string())
                 .replace("{x}", &wrapped_x.to_string())
                 .replace("{y}", &tile_y.to_string());
             let reader = Reader::new(get(&url))
                 .unwrap_or_else(|error| panic!("failed to parse tile {url}: {error:?}"));
-            // Where this tile's top-left corner lands on the map, in pixels.
-            let origin = ((tile_x * tile - left) as f32, (tile_y * tile - top) as f32);
+            let origin = (
+                (tile_x * TILE_SIZE - left) as f32,
+                (tile_y * TILE_SIZE - top) as f32,
+            );
             tiles.push((reader, origin));
         }
     }

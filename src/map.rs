@@ -4,9 +4,6 @@ use crate::screen::PANEL_BYTES;
 const MAP_RECORD_BYTES: usize = 1 + 2 * PANEL_BYTES;
 static MAP_BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/maps.bin"));
 
-pub const MAP_LATITUDE: &str = env!("MAP_LATITUDE");
-pub const MAP_LONGITUDE: &str = env!("MAP_LONGITUDE");
-
 /// A 4-gray map image as the two bit planes the panel's RAMs take
 /// (see `build.rs` for how each tone is encoded). Lives in flash.
 pub struct GrayImage {
