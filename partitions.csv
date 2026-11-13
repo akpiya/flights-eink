@@ -1,0 +1,10 @@
+# Two firmware slots so an OTA update can be written while the other one runs.
+# The bootloader finds slots by SubType (ota_0/ota_1); the names are just labels.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x4000
+otadata,  data, ota,     0xd000,   0x2000
+phy_init, data, phy,     0xf000,   0x1000
+slot_a,   app,  ota_0,   0x10000,  0x1F0000
+slot_b,   app,  ota_1,   0x200000, 0x1F0000
+# WiFi details, written once by tools/flash-wifi.sh and never touched by updates.
+config,   data, undefined, 0x3F0000, 0x1000
