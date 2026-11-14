@@ -1,3 +1,7 @@
+use core::convert::Infallible;
+
+use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
+
 pub const WIDTH: usize = 960;
 pub const HEIGHT: usize = 680;
 
@@ -18,7 +22,11 @@ pub struct Screen {
 
 impl Screen {
     pub const fn new() -> Self {
-        Self { buf: [0xFF; PANEL_BYTES] }
+        Self { buf: [0x00; PANEL_BYTES] }
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.fill(0x00);
     }
 
     pub fn in_bounds(&self, i: usize, j: usize) -> bool {
@@ -56,5 +64,29 @@ impl Screen {
 
    pub(crate) fn panel_bytes(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+/// Lets embedded-graphics draw text onto the screen; off-screen pixels are dropped.
+impl DrawTarget for Screen {
+    type Color = BinaryColor;
+    type Error = Infallible;
+
+    fn draw_iter<I: IntoIterator<Item = Pixel<BinaryColor>>>(&mut self, pixels: I) -> Result<(), Infallible> {
+        for Pixel(point, color) in pixels {
+            let (Ok(row), Ok(column)) = (usize::try_from(point.y), usize::try_from(point.x)) else {
+                continue;
+            };
+            if self.in_bounds(row, column) {
+                self.set(row, column, if color.is_on() { Color::White } else { Color::Black });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OriginDimensions for Screen {
+    fn size(&self) -> Size {
+        Size::new(WIDTH as u32, HEIGHT as u32)
     }
 }

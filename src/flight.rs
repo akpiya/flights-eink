@@ -6,11 +6,18 @@ use serde::Deserialize;
 
 use crate::https::Https;
 
-// More aircraft than this fails the whole parse.
-const MAX_FLIGHTS: usize = 32;
-// adsb.lol sends at most ~550 bytes per aircraft; the rest leaves
-// room for the HTTP headers sharing the buffer. The whole body must fit.
-const BYTES_PER_FLIGHT: usize = 640;
+// More aircraft than this fails the whole parse, including those on the ground.
+// The response buffer comes out of the stack's RAM, which TLS needs most of.
+const MAX_FLIGHTS: usize = 36;
+// adsb.lol sends ~450 bytes per aircraft on average; the rest leaves room for the
+// HTTP headers sharing the buffer. The whole body must fit.
+const BYTES_PER_FLIGHT: usize = 560;
+// Aircraft on the ground report this instead of an altitude, and serde-json-core
+// can't parse a field that's either a number or a string. Overwriting it in the
+// buffer with an equally long null (padded with JSON whitespace) makes it parse as
+// None.
+const ON_GROUND: &[u8] = br#""alt_baro":"ground""#;
+const NO_ALTITUDE: &[u8] = br#""alt_baro":null    "#;
 pub const RESPONSE_BYTES: usize = MAX_FLIGHTS * BYTES_PER_FLIGHT;
 
 #[derive(Deserialize)]
@@ -20,6 +27,8 @@ pub struct Flight {
     pub lon: Option<f32>,
     // Padded with trailing spaces, and missing for some aircraft.
     pub flight: Option<String<8>>,
+    /// Barometric altitude in feet; None on the ground.
+    pub alt_baro: Option<i32>,
     pub gs: Option<f32>,
     pub track: Option<f32>,
 }
@@ -31,8 +40,8 @@ pub enum FlightError {
     Json,
 }
 
-/// Aircraft within `radius_nm` nautical miles (the API's unit, max 250) of a point,
-/// keeping only those with a position. The API allows one request per second.
+/// Airborne aircraft within `radius_nm` nautical miles (the API's unit, max 250) of
+/// a point, keeping only those with a position. The API allows one request per second.
 pub async fn get_flights(
     https: &mut Https<'_>,
     latitude: f32,
@@ -53,6 +62,15 @@ pub async fn get_flights(
         return Err(FlightError::Status(response.status.0));
     }
     let body = response.body().read_to_end().await.map_err(FlightError::Http)?;
+    let mut searched = 0;
+    while let Some(offset) = body[searched..]
+        .windows(ON_GROUND.len())
+        .position(|window| window == ON_GROUND)
+    {
+        let start = searched + offset;
+        body[start..start + ON_GROUND.len()].copy_from_slice(NO_ALTITUDE);
+        searched = start + ON_GROUND.len();
+    }
 
     #[derive(Deserialize)]
     struct Response {
@@ -60,6 +78,8 @@ pub async fn get_flights(
     }
     let (mut response, _) =
         serde_json_core::from_slice::<Response>(body).map_err(|_| FlightError::Json)?;
-    response.ac.retain(|flight| flight.lat.is_some() && flight.lon.is_some());
+    response
+        .ac
+        .retain(|flight| flight.lat.is_some() && flight.lon.is_some() && flight.alt_baro.is_some());
     Ok(response.ac)
 }

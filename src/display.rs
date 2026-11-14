@@ -9,15 +9,12 @@ use esp_hal::{
     time::{Duration, Instant, Rate},
 };
 
-use crate::{
-    map::GrayImage,
-    screen::{HEIGHT, PANEL_BYTES, Screen, WIDTH},
-};
+use crate::screen::{HEIGHT, PANEL_BYTES, Screen, WIDTH};
 
 // The manual's section 10.2 lists command 0x24 followed by 81,600 bytes to "Load BW image":
 // https://files.waveshare.com/wiki/13.3inch-e-Paper-HAT-%28B%29/13.3inch-e-Paper-%28B%29-user-manual.pdf#page=25
 //
-// The init sequence and 4-gray mode follow Waveshare's reference driver for the 13.3" K:
+// The init sequence, 4-gray mode and partial refresh follow Waveshare's reference driver for the 13.3" K:
 // https://github.com/waveshareteam/e-Paper/blob/master/RaspberryPi_JetsonNano/c/lib/e-Paper/EPD_13in3k.c
 enum Command {
     DriverOutputControl = 0x01,
@@ -34,6 +31,7 @@ enum Command {
     WriteRedImage = 0x26,
     WriteVcom = 0x2C,
     WriteLut = 0x32,
+    DisplayOption = 0x37,
     BorderWaveform = 0x3C,
     RamXWindow = 0x44,
     RamYWindow = 0x45,
@@ -67,7 +65,30 @@ const LUT_4GRAY: [u8; 110] = [
     0x17, 0x41, 0xA8, 0x32, 0x30, //
 ];
 
-#[derive(Debug)]
+/// Waveshare's black/white partial-refresh waveform (`Lut_Partial`), laid out like
+/// `LUT_4GRAY`, except that pixels black in both RAMs (the first row) get no drive.
+/// Waveshare's pulses them toward black, which erases the map's gray.
+const LUT_PARTIAL: [u8; 110] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x2A, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x15, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x01, 0x01, 0x01, 0x00, //
+    0x0A, 0x00, 0x05, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x01, 0x01, //
+    0x22, 0x22, 0x22, 0x22, 0x22, //
+    0x17, 0x41, 0xA8, 0x32, 0x18, //
+];
+
+#[derive(Debug, defmt::Format)]
 pub enum DisplayError {
     Spi(esp_hal::spi::Error),
     BusyTimeout,
@@ -161,16 +182,12 @@ impl Display {
         self.send_data(data)
     }
 
-    /// Initializes the panel in 4-gray mode.
-    pub fn init(&mut self) -> Result<(), DisplayError> {
-        self.init_controller(0x00)?;
-
-        // Load the 4-gray waveform in place of the built-in black/white one.
-        self.command(Command::WriteLut, &LUT_4GRAY[..105])?;
-        self.command(Command::GateVoltage, &LUT_4GRAY[105..106])?;
-        self.command(Command::SourceVoltage, &LUT_4GRAY[106..109])?;
-        self.command(Command::WriteVcom, &LUT_4GRAY[109..110])?;
-        self.wait_until_idle()
+    /// Loads a waveform in place of the controller's built-in black/white one.
+    fn load_waveform(&mut self, lut: &[u8; 110]) -> Result<(), DisplayError> {
+        self.command(Command::WriteLut, &lut[..105])?;
+        self.command(Command::GateVoltage, &lut[105..106])?;
+        self.command(Command::SourceVoltage, &lut[106..109])?;
+        self.command(Command::WriteVcom, &lut[109..110])
     }
 
     /// Resets the controller and sets up the panel geometry. The software reset also
@@ -198,10 +215,18 @@ impl Display {
         self.wait_until_idle()
     }
 
-    /// Prepares the panel for storage: clears it to white with a normal black/white
-    /// full refresh (an image left on the panel for a long time can burn in), puts
-    /// the controller into deep sleep, and switches off the panel's power.
+    /// Prepares the panel for storage: clears it to white (an image left on the
+    /// panel for a long time can burn in) and switches off the panel's power.
     pub fn clear_and_sleep(&mut self) -> Result<(), DisplayError> {
+        self.clear()?;
+        self.pwr.set_level(Level::Low);
+        Ok(())
+    }
+
+    /// Clears the panel to white with the controller's built-in black/white full
+    /// refresh. Its strong waveform fully resets every pixel, removing the ghosting
+    /// that partial refreshes build up and the gentler 4-gray refresh leaves behind.
+    pub fn clear(&mut self) -> Result<(), DisplayError> {
         self.init_controller(0x01)?;
         let white = [0xFF; WIDTH / 8];
         for command in [Command::WriteImage, Command::WriteRedImage] {
@@ -214,37 +239,76 @@ impl Display {
         self.send_data(&[0xF7])?;
         self.send_command(Command::MasterActivation)?;
         self.wait_until_idle()?;
-
-        self.sleep()?;
-        self.pwr.set_level(Level::Low);
-        Ok(())
+        self.sleep()
     }
 
-    /// Shows a 4-gray background with the screen's black pixels drawn on top.
+    /// Shows the map's lines in light gray on black with the screen's white pixels
+    /// drawn on top, using a full 4-gray refresh.
     ///
-    /// Black is 1 in both RAM planes, so each overlay pixel that is black
-    /// (0 in `Screen`) is OR-ed into both planes as the rows are streamed out.
-    pub fn show(&mut self, background: &GrayImage, overlay: &Screen) -> Result<(), DisplayError> {
+    /// The panel is woken first and put back to sleep after: Waveshare warns that
+    /// leaving it powered up between refreshes damages it.
+    pub fn show(&mut self, map: &[u8], overlay: &Screen) -> Result<(), DisplayError> {
+        self.init_controller(0x00)?;
+        self.load_waveform(&LUT_4GRAY)?;
+        self.wait_until_idle()?;
+
+        // Each pixel's bits in the two RAMs, per Waveshare's driver: white 0/0,
+        // light gray 1/0, gray 0/1, black 1/1.
+        assert_eq!(map.len(), PANEL_BYTES);
         let overlay = overlay.panel_bytes();
-        for (command, plane) in [
-            (Command::WriteImage, background.bw_ram),
-            (Command::WriteRedImage, background.red_ram),
-        ] {
-            assert_eq!(plane.len(), PANEL_BYTES);
+        let row_bytes = WIDTH / 8;
+        let planes: [(Command, fn(u8, u8) -> u8); 2] = [
+            (Command::WriteImage, |_line, white| !white),
+            (Command::WriteRedImage, |line, white| !line & !white),
+        ];
+        for (command, bits) in planes {
             self.send_command(command)?;
             let mut row = [0u8; WIDTH / 8];
-            for (plane_row, overlay_row) in plane.chunks_exact(row.len()).zip(overlay.chunks_exact(row.len())) {
-                for ((out, &map), &screen) in row.iter_mut().zip(plane_row).zip(overlay_row) {
-                    *out = map | !screen;
+            for (map_row, overlay_row) in map.chunks_exact(row_bytes).zip(overlay.chunks_exact(row_bytes)) {
+                for ((out, &line), &white) in row.iter_mut().zip(map_row).zip(overlay_row) {
+                    *out = bits(line, white);
                 }
                 self.send_data(&row)?;
             }
         }
 
-        self.send_command(Command::ImageUpdate)?;
-        self.send_data(&[0xC7])?;
+        self.command(Command::ImageUpdate, &[0xC7])?;
         self.send_command(Command::MasterActivation)?;
-        self.wait_until_idle()
+        self.wait_until_idle()?;
+        self.sleep()
+    }
+
+    /// Quickly redraws only the overlay with a black/white partial refresh, leaving
+    /// the map as it is. `screen` must hold the overlay currently on the panel;
+    /// `draw` then draws the new one into it.
+    ///
+    /// The panel only drives pixels that differ between the old image (RED RAM) and
+    /// the new one (BW RAM), and only to black or white. So a pixel going from white
+    /// back to black over one of the map's lines ends up black until the next `show`.
+    pub fn refresh_overlay(
+        &mut self,
+        screen: &mut Screen,
+        draw: impl FnOnce(&mut Screen),
+    ) -> Result<(), DisplayError> {
+        self.init_controller(0x80)?;
+        self.load_waveform(&LUT_PARTIAL)?;
+        // Copied from Waveshare's EPD_13IN3K_Init_Part, which doesn't document it.
+        self.command(Command::DisplayOption, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00])?;
+        // Power up the analog circuits before writing the images.
+        self.command(Command::ImageUpdate, &[0xC0])?;
+        self.send_command(Command::MasterActivation)?;
+        self.wait_until_idle()?;
+
+        // Same polarity as `Screen` in black/white mode: 1 is white, 0 is black.
+        self.command(Command::WriteRedImage, screen.panel_bytes())?;
+        screen.clear();
+        draw(screen);
+        self.command(Command::WriteImage, screen.panel_bytes())?;
+
+        self.command(Command::ImageUpdate, &[0xCF])?;
+        self.send_command(Command::MasterActivation)?;
+        self.wait_until_idle()?;
+        self.sleep()
     }
 
     pub fn sleep(&mut self) -> Result<(), DisplayError> {

@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 
+mod airport;
 mod display;
 mod encoder;
 mod flight;
 mod https;
 mod ota;
+mod plane;
 mod wifi_config;
 mod screen;
 mod map;
@@ -44,6 +46,11 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const ROOT_CERTS: &str = concat!(include_str!("../certs/isrg-roots.pem"), "\0");
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+// Quick partial refreshes leave black marks where planes leave the map's lines, and
+// ghosting builds up; a hard refresh (clear, then redraw) removes both but flashes
+// for several seconds.
+const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 static TLS_RNG: StaticCell<Trng> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
@@ -84,12 +91,9 @@ async fn main(spawner: Spawner) -> ! {
     info!("Firmware version {}", ota::VERSION);
     let mut screen = Screen::new();
     let map = Map::new();
-    display.init().unwrap();
-    info!("Display initialized");
-    display.show(&map.background(), &screen).unwrap();
+    display.show(map.background(), &screen).unwrap();
     info!("Map shown");
 
-    // TEMPORARY: fetch flights around Austin to check the API works on the device.
     // TLS needs unpredictable random numbers, which the TRNG source provides.
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
     let trng = TLS_RNG.init(Trng::try_new().expect("TRNG source is enabled"));
@@ -130,7 +134,10 @@ async fn main(spawner: Spawner) -> ! {
     let ca = Certificate::new(X509::PEM(root_certs)).expect("root certificates parse");
     let mut https = Https::new(stack, ca, tls.reference());
 
+    let (latitude, longitude) = map.center();
+    let radius_nm = map.radius_nm();
     let mut next_update_check = Instant::now();
+    let mut next_full_refresh = Instant::now() + FULL_REFRESH_INTERVAL;
     loop {
         if Instant::now() >= next_update_check {
             if let Err(error) = ota::update(&mut https, &mut flash).await {
@@ -138,24 +145,47 @@ async fn main(spawner: Spawner) -> ! {
             }
             next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
         }
-        match flight::get_flights(&mut https, 30.2672, -97.7431, 25).await {
+        match flight::get_flights(&mut https, latitude, longitude, radius_nm).await {
             Ok(flights) => {
                 info!("{} flights", flights.len());
-                for flight in &flights {
-                    info!(
-                        "{} at {}, {}: {} kt, {} deg",
-                        flight.flight.as_deref(),
-                        flight.lat,
-                        flight.lon,
-                        flight.gs,
-                        flight.track
-                    );
+                let draw = |screen: &mut Screen| {
+                    for &(latitude, longitude, code) in airport::AIRPORTS {
+                        airport::draw(screen, map.position(latitude, longitude), code);
+                    }
+                    for flight in &flights {
+                        if let (Some(lat), Some(lon)) = (flight.lat, flight.lon) {
+                            plane::draw(screen, map.position(lat, lon), flight);
+                        }
+                    }
+                };
+                let refreshed = if Instant::now() >= next_full_refresh {
+                    next_full_refresh = Instant::now() + FULL_REFRESH_INTERVAL;
+                    info!("Hard refresh");
+                    screen.clear();
+                    draw(&mut screen);
+                    display
+                        .clear()
+                        .and_then(|()| display.show(map.background(), &screen))
+                } else {
+                    display.refresh_overlay(&mut screen, draw)
+                };
+                if let Err(error) = refreshed {
+                    info!("Display refresh failed: {}", error);
                 }
             }
+            // The last flights stay on screen until a request succeeds.
             Err(error) => info!("get_flights failed: {}", error),
         }
-        Timer::after(Duration::from_secs(10)).await;
+        Timer::after(REFRESH_INTERVAL).await;
     }
+}
+
+/// Called by esp-backtrace after printing a panic. Restarting instead of halting
+/// keeps an unattended device running, and lets a crashing update be rolled back
+/// (see `ota::check_previous_boot`).
+#[unsafe(no_mangle)]
+fn custom_halt() -> ! {
+    esp_hal::system::software_reset()
 }
 
 #[embassy_executor::task]
