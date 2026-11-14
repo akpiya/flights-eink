@@ -13,7 +13,7 @@ defmt = "1.0.1"
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32", "unstable"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt", "esp32"] }
 critical-section = "1.2.0"
-esp-backtrace = { version = "0.20.0", features = ["defmt", "esp32", "panic-handler"] }
+esp-backtrace = { version = "0.20.0", features = ["custom-halt", "defmt", "esp32", "panic-handler"] }
 esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32"] }
 esp-rtos = { version = "0.4.0", features = ["esp32", "esp-radio", "esp-alloc", "embassy", "defmt"] }
 esp-alloc = { version = "0.11.0", features = ["esp32"] }
@@ -29,6 +29,8 @@ embassy-time = "0.5"
 mbedtls-rs = "0.1.0"
 sha2 = { version = "0.10", default-features = false }
 embedded-io-async = "0.7"
+libm = "0.2"
+embedded-graphics = "0.8"
 
 [build-dependencies]
 ureq = { version = "3", default-features = false, features = ["rustls"] }

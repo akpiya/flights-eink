@@ -1,7 +1,7 @@
 use std::{env, f64::consts::PI, fs, path::PathBuf};
 
 use mvt_reader::{Reader, feature::Value};
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 const WIDTH: usize = 960;
 const HEIGHT: usize = 680;
@@ -11,66 +11,21 @@ const TILEJSON_URL: &str = "https://tiles.openfreemap.org/planet";
 const USER_AGENT: &str = "epaper-map-builder/0.1";
 const TILE_SIZE: i64 = 256;
 
-const DEFAULT_ZOOMS: &str = "13";
+const DEFAULT_ZOOMS: &str = "10";
 const DEFAULT_LATITUDE: &str = "30.2672";
 const DEFAULT_LONGITUDE: &str = "-97.7431";
 
-/// The map uses the panel's two lightest gray levels; the darker gray and black
-/// are left for overlays.
-#[derive(Clone, Copy, PartialEq)]
-enum Tone {
-    White,
-    LightGray,
-}
-
-impl Tone {
-    /// The gray value each tone is rendered with before being mapped back to a `Tone`.
-    const fn luma(self) -> u8 {
-        match self {
-            Tone::White => 255,
-            Tone::LightGray => 200,
-        }
-    }
-
-    fn from_luma(luma: u8) -> Self {
-        [Tone::White, Tone::LightGray]
-            .into_iter()
-            .find(|tone| tone.luma() == luma)
-            .unwrap_or_else(|| panic!("rendered unexpected gray value {luma}"))
-    }
-
-    /// The pixel's bits in the panel's two RAMs in 4-gray mode, per Waveshare's
-    /// EPD_13in3k driver: white 0/0, light gray 1/0, gray 0/1, black 1/1.
-    const fn ram_bits(self) -> (bool, bool) {
-        match self {
-            Tone::White => (false, false),
-            Tone::LightGray => (true, false),
-        }
-    }
-}
-
-/// Filled areas, painted in order so later layers cover earlier ones.
-/// `None` matches every feature in the layer.
-const AREAS: &[(&str, Option<&[&str]>, Tone)] = &[
-    ("landcover", Some(&["wood", "grass", "farmland", "wetland"]), Tone::LightGray),
-    ("park", None, Tone::LightGray),
-    ("water", None, Tone::LightGray),
-    ("aeroway", Some(&["runway", "taxiway", "apron"]), Tone::LightGray),
-];
-
-/// Line width in pixels and tone by feature class; unlisted classes aren't drawn.
-const WATERWAYS: &[(&str, f32, Tone)] = &[
-    ("river", 2.0, Tone::LightGray),
-    ("canal", 1.0, Tone::LightGray),
-];
-const ROADS: &[(&str, f32, Tone)] = &[
-    ("motorway", 3.0, Tone::LightGray),
-    ("trunk", 3.0, Tone::LightGray),
-    ("primary", 3.0, Tone::LightGray),
-    ("secondary", 2.0, Tone::LightGray),
-    ("tertiary", 2.0, Tone::LightGray),
-    ("minor", 1.0, Tone::LightGray),
-    ("rail", 1.0, Tone::LightGray),
+/// Line width in pixels by feature class; unlisted classes aren't drawn. The device
+/// shows lines light gray on black.
+const WATERWAYS: &[(&str, f32)] = &[("river", 2.0), ("canal", 1.0)];
+const ROADS: &[(&str, f32)] = &[
+    ("motorway", 3.0),
+    ("trunk", 3.0),
+    ("primary", 3.0),
+    ("secondary", 2.0),
+    ("tertiary", 2.0),
+    ("minor", 1.0),
+    ("rail", 1.0),
 ];
 
 fn main() {
@@ -95,16 +50,41 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
 
     let tile_url_pattern = fetch_tile_url_pattern();
-    let mut maps = Vec::with_capacity(zooms.len() * (1 + 2 * PANEL_BYTES));
+    // Each record: zoom, the map's top-left world pixel as two little-endian i32s
+    // (the device needs it to place planes), then the packed image.
+    let mut maps = Vec::with_capacity(zooms.len() * (9 + PANEL_BYTES));
+    let mut airports: Vec<Airport> = Vec::new();
     for zoom in zooms {
-        let map = render_map(&tile_url_pattern, zoom, latitude.into(), longitude.into());
-        let (bw_ram, red_ram) = pack_ram_planes(&map);
+        let (left, top) = top_left(zoom, latitude.into(), longitude.into());
+        let tiles = fetch_tiles(&tile_url_pattern, zoom, left, top);
+        let map = render_map(&tiles);
+        for airport in find_airports(&tiles, zoom, left, top) {
+            if !airports.iter().any(|known| known.code == airport.code) {
+                airports.push(airport);
+            }
+        }
         maps.push(zoom);
-        maps.extend(bw_ram);
-        maps.extend(red_ram);
+        for world_pixel in [left, top] {
+            let world_pixel = i32::try_from(world_pixel).expect("world pixels fit in i32 up to zoom 14");
+            maps.extend(world_pixel.to_le_bytes());
+        }
+        maps.extend(pack(&map));
     }
 
     fs::write(out_dir.join("maps.bin"), maps).expect("write map data bundle");
+
+    // Included by src/airport.rs as a Rust slice expression.
+    let airports: String = airports
+        .iter()
+        .map(|airport| format!("({:?}, {:?}, {:?}),\n", airport.latitude, airport.longitude, airport.code))
+        .collect();
+    fs::write(out_dir.join("airports.rs"), format!("&[\n{airports}]\n")).expect("write airport list");
+}
+
+struct Airport {
+    latitude: f32,
+    longitude: f32,
+    code: String,
 }
 
 fn parse_coordinate(value: &str, min: f32, max: f32) -> f32 {
@@ -181,12 +161,18 @@ fn world_pixel(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
     (x, y)
 }
 
-/// Downloads every vector tile overlapping a WIDTH x HEIGHT window centered on the
-/// coordinate and draws them into one image of `Tone`s.
-fn render_map(tile_url_pattern: &str, zoom: u8, latitude: f64, longitude: f64) -> Vec<Tone> {
+/// The world pixel of the top-left corner of a WIDTH x HEIGHT map centered on the
+/// coordinate.
+fn top_left(zoom: u8, latitude: f64, longitude: f64) -> (i64, i64) {
     let (center_x, center_y) = world_pixel(latitude, longitude, zoom);
     let left = (center_x - WIDTH as f64 / 2.0).round() as i64;
     let top = (center_y - HEIGHT as f64 / 2.0).round() as i64;
+    (left, top)
+}
+
+/// Downloads every vector tile overlapping the WIDTH x HEIGHT map whose top-left
+/// corner is world pixel (`left`, `top`), each with where its corner falls on the map.
+fn fetch_tiles(tile_url_pattern: &str, zoom: u8, left: i64, top: i64) -> Vec<(Reader, (f32, f32))> {
     let tiles_per_side = 1i64 << zoom;
 
     let mut tiles = Vec::new();
@@ -210,42 +196,67 @@ fn render_map(tile_url_pattern: &str, zoom: u8, latitude: f64, longitude: f64) -
             tiles.push((reader, origin));
         }
     }
+    tiles
+}
 
+/// Draws the tiles' lines, returning whether each map pixel is part of one.
+fn render_map(tiles: &[(Reader, (f32, f32))]) -> Vec<bool> {
     let mut pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).expect("map size is valid");
-    pixmap.fill(tiny_skia::Color::WHITE);
+    pixmap.fill(tiny_skia::Color::BLACK);
 
-    // Draw layer by layer across all tiles, so e.g. water always covers parks.
-    for &(layer, classes, tone) in AREAS {
-        for (reader, origin) in &tiles {
-            for (feature, scale) in features(reader, layer) {
-                if classes.is_some_and(|classes| !classes.contains(&class(&feature))) {
-                    continue;
-                }
-                fill_polygons(&mut pixmap, &feature.geometry, *origin, scale, tone);
-            }
-        }
-    }
     for (layer, widths) in [("waterway", WATERWAYS), ("transportation", ROADS)] {
-        for (reader, origin) in &tiles {
+        for (reader, origin) in tiles {
             for (feature, scale) in features(reader, layer) {
-                let Some(&(_, width, tone)) = widths.iter().find(|(c, ..)| *c == class(&feature))
+                let Some(&(_, width)) = widths.iter().find(|(c, _)| *c == class(&feature))
                 else {
                     continue;
                 };
                 if property(&feature, "brunnel") == Some("tunnel") {
                     continue;
                 }
-                stroke_lines(&mut pixmap, &feature.geometry, *origin, scale, width, tone);
+                stroke_lines(&mut pixmap, &feature.geometry, *origin, scale, width);
             }
         }
     }
 
-    // Anti-aliasing is off, so every pixel is exactly one of the tones' gray values.
-    pixmap
-        .pixels()
-        .iter()
-        .map(|pixel| Tone::from_luma(pixel.red()))
-        .collect()
+    // Anti-aliasing is off, so every pixel is pure black or pure white.
+    pixmap.pixels().iter().map(|pixel| pixel.red() == 255).collect()
+}
+
+/// The airports on the map with an IATA code, which in practice means passenger
+/// airports. (OpenFreeMap classes everything but international airports as
+/// "other", down to private strips and heliports.)
+fn find_airports(tiles: &[(Reader, (f32, f32))], zoom: u8, left: i64, top: i64) -> Vec<Airport> {
+    let world_size = TILE_SIZE as f64 * f64::from(1u32 << zoom);
+    let mut airports = Vec::new();
+    for (reader, (origin_x, origin_y)) in tiles {
+        for (feature, scale) in features(reader, "aerodrome_label") {
+            let Some(code) = property(&feature, "iata") else {
+                continue;
+            };
+            let geo_types::Geometry::MultiPoint(points) = &feature.geometry else {
+                continue;
+            };
+            let Some(point) = points.0.first() else {
+                continue;
+            };
+            let (x, y) = (origin_x + point.x() * scale, origin_y + point.y() * scale);
+            if !(0.0..WIDTH as f32).contains(&x) || !(0.0..HEIGHT as f32).contains(&y) {
+                continue;
+            }
+            // Back from world pixel to coordinate: the inverse of `world_pixel`.
+            let world_x = left as f64 + f64::from(x);
+            let world_y = top as f64 + f64::from(y);
+            let longitude = world_x / world_size * 360.0 - 180.0;
+            let latitude = (PI * (1.0 - 2.0 * world_y / world_size)).sinh().atan().to_degrees();
+            airports.push(Airport {
+                latitude: latitude as f32,
+                longitude: longitude as f32,
+                code: code.to_owned(),
+            });
+        }
+    }
+    airports
 }
 
 /// The features of one layer, each with the scale from tile units to pixels.
@@ -274,39 +285,12 @@ fn class(feature: &mvt_reader::feature::Feature) -> &str {
     property(feature, "class").unwrap_or("")
 }
 
-fn paint(tone: Tone) -> Paint<'static> {
+fn white() -> Paint<'static> {
     let mut paint = Paint::default();
-    let luma = tone.luma();
-    paint.set_color_rgba8(luma, luma, luma, 255);
-    // Exact tones only: anti-aliasing would create in-between grays.
+    paint.set_color(tiny_skia::Color::WHITE);
+    // Pure black and white only: anti-aliasing would create grays.
     paint.anti_alias = false;
     paint
-}
-
-fn fill_polygons(
-    pixmap: &mut Pixmap,
-    geometry: &geo_types::Geometry<f32>,
-    origin: (f32, f32),
-    scale: f32,
-    tone: Tone,
-) {
-    let polygons = match geometry {
-        geo_types::Geometry::Polygon(polygon) => vec![polygon.clone()],
-        geo_types::Geometry::MultiPolygon(multi) => multi.0.clone(),
-        _ => return,
-    };
-    for polygon in polygons {
-        // One path per polygon with even-odd filling, so its holes (islands in a
-        // lake, clearings in a park) stay unpainted.
-        let mut path = PathBuilder::new();
-        for ring in std::iter::once(polygon.exterior()).chain(polygon.interiors()) {
-            add_points(&mut path, ring.0.iter(), origin, scale);
-            path.close();
-        }
-        if let Some(path) = path.finish() {
-            pixmap.fill_path(&path, &paint(tone), FillRule::EvenOdd, Transform::identity(), None);
-        }
-    }
 }
 
 fn stroke_lines(
@@ -315,7 +299,6 @@ fn stroke_lines(
     origin: (f32, f32),
     scale: f32,
     width: f32,
-    tone: Tone,
 ) {
     let lines = match geometry {
         geo_types::Geometry::LineString(line) => vec![line.clone()],
@@ -332,7 +315,7 @@ fn stroke_lines(
         let mut path = PathBuilder::new();
         add_points(&mut path, line.0.iter(), origin, scale);
         if let Some(path) = path.finish() {
-            pixmap.stroke_path(&path, &paint(tone), &stroke, Transform::identity(), None);
+            pixmap.stroke_path(&path, &white(), &stroke, Transform::identity(), None);
         }
     }
 }
@@ -355,17 +338,9 @@ fn add_points<'a>(
     }
 }
 
-/// Splits the map into the two bit planes the panel's RAMs take in 4-gray mode
-/// (command 0x24 "BW RAM", then 0x26 "RED RAM"), 8 pixels per byte, MSB first.
-fn pack_ram_planes(map: &[Tone]) -> (Vec<u8>, Vec<u8>) {
-    let pack = |bit: fn((bool, bool)) -> bool| -> Vec<u8> {
-        map.chunks_exact(8)
-            .map(|pixels| {
-                pixels
-                    .iter()
-                    .fold(0, |byte, tone| (byte << 1) | u8::from(bit(tone.ram_bits())))
-            })
-            .collect()
-    };
-    (pack(|(bw, _)| bw), pack(|(_, red)| red))
+/// Packs the map 8 pixels per byte, MSB first, 1 for a line: the panel's RAM layout.
+fn pack(map: &[bool]) -> Vec<u8> {
+    map.chunks_exact(8)
+        .map(|pixels| pixels.iter().fold(0, |byte, &white| (byte << 1) | u8::from(white)))
+        .collect()
 }
