@@ -1369,6 +1369,7 @@ dependencies = [
  "esp-rtos",
  "geo-types",
  "heapless 0.9.3",
+ "libm",
  "mbedtls-rs",
  "mvt-reader",
  "reqwless",

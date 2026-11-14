@@ -130,6 +130,8 @@ async fn main(spawner: Spawner) -> ! {
     let ca = Certificate::new(X509::PEM(root_certs)).expect("root certificates parse");
     let mut https = Https::new(stack, ca, tls.reference());
 
+    let (latitude, longitude) = map.center();
+    let radius_nm = map.radius_nm();
     let mut next_update_check = Instant::now();
     loop {
         if Instant::now() >= next_update_check {
@@ -138,7 +140,7 @@ async fn main(spawner: Spawner) -> ! {
             }
             next_update_check = Instant::now() + UPDATE_CHECK_INTERVAL;
         }
-        match flight::get_flights(&mut https, 30.2672, -97.7431, 25).await {
+        match flight::get_flights(&mut https, latitude, longitude, radius_nm).await {
             Ok(flights) => {
                 info!("{} flights", flights.len());
                 for flight in &flights {

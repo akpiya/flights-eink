@@ -95,11 +95,18 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
 
     let tile_url_pattern = fetch_tile_url_pattern();
-    let mut maps = Vec::with_capacity(zooms.len() * (1 + 2 * PANEL_BYTES));
+    // Each record: zoom, the map's top-left world pixel as two little-endian i32s
+    // (so the device knows where the map is), then the two RAM planes.
+    let mut maps = Vec::with_capacity(zooms.len() * (9 + 2 * PANEL_BYTES));
     for zoom in zooms {
-        let map = render_map(&tile_url_pattern, zoom, latitude.into(), longitude.into());
+        let (left, top) = top_left(zoom, latitude.into(), longitude.into());
+        let map = render_map(&tile_url_pattern, zoom, left, top);
         let (bw_ram, red_ram) = pack_ram_planes(&map);
         maps.push(zoom);
+        for world_pixel in [left, top] {
+            let world_pixel = i32::try_from(world_pixel).expect("world pixels fit in i32 up to zoom 14");
+            maps.extend(world_pixel.to_le_bytes());
+        }
         maps.extend(bw_ram);
         maps.extend(red_ram);
     }
@@ -181,12 +188,18 @@ fn world_pixel(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
     (x, y)
 }
 
-/// Downloads every vector tile overlapping a WIDTH x HEIGHT window centered on the
-/// coordinate and draws them into one image of `Tone`s.
-fn render_map(tile_url_pattern: &str, zoom: u8, latitude: f64, longitude: f64) -> Vec<Tone> {
+/// The world pixel of the top-left corner of a WIDTH x HEIGHT map centered on the
+/// coordinate.
+fn top_left(zoom: u8, latitude: f64, longitude: f64) -> (i64, i64) {
     let (center_x, center_y) = world_pixel(latitude, longitude, zoom);
     let left = (center_x - WIDTH as f64 / 2.0).round() as i64;
     let top = (center_y - HEIGHT as f64 / 2.0).round() as i64;
+    (left, top)
+}
+
+/// Downloads every vector tile overlapping the WIDTH x HEIGHT map whose top-left
+/// corner is world pixel (`left`, `top`) and draws them into one image of `Tone`s.
+fn render_map(tile_url_pattern: &str, zoom: u8, left: i64, top: i64) -> Vec<Tone> {
     let tiles_per_side = 1i64 << zoom;
 
     let mut tiles = Vec::new();
